@@ -196,6 +196,39 @@ static void add_te_chunked(apr_pool_t *p,
     APR_BRIGADE_INSERT_TAIL(header_brigade, e);
 }
 
+static void add_trailer_line(const char * key, const char *val, apr_pool_t *p,
+                             apr_bucket_alloc_t *bucket_alloc,
+                             apr_bucket_brigade *bb)
+{
+    apr_bucket *e;
+    char *buf;
+
+    buf = apr_pstrcat(p, key, ": ", val, CRLF, NULL);
+    ap_xlate_proto_to_ascii(buf, strlen(buf));
+
+    e = apr_bucket_immortal_create(buf, strlen(buf), bucket_alloc);
+    APR_BRIGADE_INSERT_TAIL(bb, e);
+}
+
+static void forward_declared_trailers(apr_pool_t *p, const request_rec *r,
+                                      apr_bucket_alloc_t *bucket_alloc,
+                                      apr_bucket_brigade *bb)
+{
+    const char *declared_trailers = apr_table_get(r->headers_in, "Trailer");
+    if (declared_trailers) {
+        char *mod_trailers = apr_pstrcat(p, declared_trailers, NULL);
+        char *key;
+        char *last = NULL;
+        while ((key = apr_strtok(mod_trailers, ", ", &last))) {
+            const char *value = apr_table_get(r->trailers_in, key);
+            if (value) {
+                add_trailer_line(key, value, p, bucket_alloc, bb);
+            }
+            mod_trailers = last;
+        }
+    }
+}
+
 static void add_cl(apr_pool_t *p,
                    apr_bucket_alloc_t *bucket_alloc,
                    apr_bucket_brigade *header_brigade,
@@ -344,10 +377,18 @@ static int stream_reqbody_chunked(apr_pool_t *p,
         bb = input_brigade;
     }
 
-    e = apr_bucket_immortal_create(ASCII_ZERO ASCII_CRLF
+    if (apr_is_empty_table(r->trailers_in)) {
+        e = apr_bucket_immortal_create(ASCII_ZERO ASCII_CRLF
                                    /* <trailers> */
                                    ASCII_CRLF,
                                    5, bucket_alloc);
+    } else {
+        e = apr_bucket_immortal_create(ASCII_ZERO ASCII_CRLF,
+                                   3, bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(bb, e);
+        forward_declared_trailers(p, r, bucket_alloc, bb);
+        e = apr_bucket_immortal_create(ASCII_CRLF, 2, bucket_alloc);
+    }
     APR_BRIGADE_INSERT_TAIL(bb, e);
 
     if (apr_table_get(r->subprocess_env, "proxy-sendextracrlf")) {
@@ -932,7 +973,18 @@ skip_body:
         e = apr_bucket_pool_create(buf, strlen(buf), p, c->bucket_alloc);
         APR_BRIGADE_INSERT_TAIL(header_brigade, e);
     }
-
+    /** pass tailer header and enforce chunked */
+    if (old_te_val) {
+        const char *trailer = apr_table_get(r->headers_in, "Trailer");
+        if (trailer) {
+            char *buf = apr_pstrcat(p, "Trailer: ", trailer, CRLF, NULL);
+            ap_xlate_proto_to_ascii(buf, strlen(buf));
+            APR_BRIGADE_INSERT_TAIL(header_brigade,
+                                    apr_bucket_pool_create(buf, strlen(buf),
+                                                           p, bucket_alloc));
+            rb_method = RB_STREAM_CHUNKED;
+        }
+    }
     /* send the request body, if any. */
     switch(rb_method) {
     case RB_STREAM_CHUNKED:
